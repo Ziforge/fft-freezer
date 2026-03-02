@@ -1,0 +1,75 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS
+            artifact: fft-freezer-macOS
+          - os: ubuntu-latest
+            name: Linux
+            artifact: fft-freezer-linux-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfreetype-dev libx11-dev libxrandr-dev libxcursor-dev libxinerama-dev libgl-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd build/FFTFreezer_artefacts/Release
+          zip -r ${{ github.workspace }}/${{ matrix.artifact }}-Standalone.zip "Standalone/FFT Freezer.app"
+          zip -r ${{ github.workspace }}/${{ matrix.artifact }}-VST3.zip "VST3/FFT Freezer.vst3"
+          zip -r ${{ github.workspace }}/${{ matrix.artifact }}-AU.zip "AU/FFT Freezer.component" || true
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd build/FFTFreezer_artefacts/Release
+          tar czf ${{ github.workspace }}/${{ matrix.artifact }}.tar.gz Standalone/ VST3/
+          cd VST3 && zip -r ${{ github.workspace }}/${{ matrix.artifact }}-VST3.zip "FFT Freezer.vst3"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

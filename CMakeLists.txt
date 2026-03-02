@@ -24,7 +24,7 @@ juce_add_plugin(FFTFreezer
     COPY_PLUGIN_AFTER_BUILD TRUE
     PLUGIN_MANUFACTURER_CODE VbFz
     PLUGIN_CODE FrZr
-    FORMATS VST3 Standalone
+    FORMATS AU VST3 Standalone
     PRODUCT_NAME "FFT Freezer"
 )
 
