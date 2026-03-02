@@ -28,8 +28,8 @@ private:
     juce::Label threshLabel, mixLabel, recLenLabel, statusLabel;
 
     // Progress bar for recording
-    juce::ProgressBar* progressBar = nullptr;
     double progressValue = 0.0;
+    juce::ProgressBar progressBar { progressValue };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FFTFreezerEditor)
 };

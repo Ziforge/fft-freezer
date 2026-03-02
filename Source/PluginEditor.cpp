@@ -27,8 +27,7 @@ FFTFreezerEditor::FFTFreezerEditor (FFTFreezerProcessor& p)
     addAndMakeVisible (writeButton);
 
     // Progress bar
-    progressBar = new juce::ProgressBar (progressValue);
-    progressBar->setColour (juce::ProgressBar::foregroundColourId, recActiveColour);
+    progressBar.setColour (juce::ProgressBar::foregroundColourId, recActiveColour);
     addAndMakeVisible (progressBar);
 
     // Threshold slider
@@ -82,10 +81,7 @@ FFTFreezerEditor::FFTFreezerEditor (FFTFreezerProcessor& p)
     startTimerHz (30);
 }
 
-FFTFreezerEditor::~FFTFreezerEditor()
-{
-    delete progressBar;
-}
+FFTFreezerEditor::~FFTFreezerEditor() {}
 
 //==============================================================================
 void FFTFreezerEditor::paint (juce::Graphics& g)
@@ -109,7 +105,7 @@ void FFTFreezerEditor::resized()
 
     // Progress bar
     area.removeFromTop (4);
-    progressBar->setBounds (area.removeFromTop (14).reduced (4, 0));
+    progressBar.setBounds (area.removeFromTop (14).reduced (4, 0));
 
     area.removeFromTop (6);
 
