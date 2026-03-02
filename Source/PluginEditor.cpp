@@ -84,7 +84,7 @@ void FFTFreezerEditor::paint (juce::Graphics& g)
 
     // Title
     g.setColour (textColour);
-    g.setFont (juce::Font (22.0f));
+    g.setFont (juce::FontOptions (22.0f));
     g.drawText ("FFT FREEZER", getLocalBounds().removeFromTop (40), juce::Justification::centred);
 }
 
