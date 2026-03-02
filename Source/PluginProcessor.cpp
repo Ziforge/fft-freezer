@@ -1,18 +1,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include <cmath>
-
-//==============================================================================
-// Worker thread for FFT freeze (avoid blocking audio thread)
-//==============================================================================
-class FreezeThread : public juce::Thread
-{
-public:
-    FreezeThread (FFTFreezerProcessor& p) : juce::Thread ("FreezeThread"), proc (p) {}
-    void run() override { proc.triggerFreeze(); }
-private:
-    FFTFreezerProcessor& proc;
-};
+#include <thread>
 
 //==============================================================================
 FFTFreezerProcessor::FFTFreezerProcessor()
@@ -29,29 +18,20 @@ FFTFreezerProcessor::FFTFreezerProcessor()
         "reclen", "Record Length (s)", 0.1f, 10.0f, 2.0f));
 }
 
-FFTFreezerProcessor::~FFTFreezerProcessor()
-{
-    if (freezeThread) freezeThread->stopThread (2000);
-}
+FFTFreezerProcessor::~FFTFreezerProcessor() {}
 
 //==============================================================================
 void FFTFreezerProcessor::prepareToPlay (double sampleRate, int /*samplesPerBlock*/)
 {
     currentSampleRate = sampleRate;
 
-    // Allocate ring buffer for max record length (10s)
-    ringSize = (int)(recLenParam->get() * sampleRate);
-    if (ringSize < 2048) ringSize = 2048;
-    ringBuffer.resize (ringSize, 0.0f);
-    ringIndex = 0;
+    // Pre-allocate record buffer for max length (10s)
+    int maxRec = (int)(10.0 * sampleRate);
+    recBuffer.resize (maxRec, 0.0f);
 
-    // Build fade window (1000 sample linear fade in/out like the original)
-    window.resize (ringSize);
-    int fade = std::min (1000, ringSize / 2);
-    for (int i = 0; i < fade; ++i)
-        window[i] = window[ringSize - 1 - i] = (float)i / (float)fade;
-    for (int i = fade; i < ringSize - fade; ++i)
-        window[i] = 1.0f;
+    // Pre-allocate loop buffers
+    loopA.resize (maxRec, 0.0f);
+    loopB.resize (maxRec, 0.0f);
 }
 
 void FFTFreezerProcessor::releaseResources() {}
@@ -62,60 +42,53 @@ void FFTFreezerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     auto numSamples = buffer.getNumSamples();
     auto numChannels = buffer.getNumChannels();
 
-    // --- Record mono mix into ring buffer ---
-    // Recompute ringSize if recLen changed
-    int desiredRingSize = (int)(recLenParam->get() * currentSampleRate);
-    if (desiredRingSize < 2048) desiredRingSize = 2048;
-    if (desiredRingSize != ringSize)
-    {
-        ringSize = desiredRingSize;
-        ringBuffer.resize (ringSize, 0.0f);
-        if (ringIndex >= ringSize) ringIndex = 0;
-        // Rebuild window
-        window.resize (ringSize);
-        int fade = std::min (1000, ringSize / 2);
-        for (int i = 0; i < fade; ++i)
-            window[i] = window[ringSize - 1 - i] = (float)i / (float)fade;
-        for (int i = fade; i < ringSize - fade; ++i)
-            window[i] = 1.0f;
-    }
+    auto curState = state.load();
 
-    float scale = (numChannels > 0) ? 1.0f / (float)numChannels : 1.0f;
-    for (int s = 0; s < numSamples; ++s)
+    // --- Recording state: capture mono-mixed input ---
+    if (curState == Recording)
     {
-        float mono = 0.0f;
-        for (int ch = 0; ch < numChannels; ++ch)
-            mono += buffer.getSample (ch, s);
-        mono *= scale;
+        float scale = (numChannels > 0) ? 1.0f / (float)numChannels : 1.0f;
+        int pos = recWritePos.load();
 
-        ringBuffer[ringIndex] = mono;
-        ringIndex = (ringIndex + 1) % ringSize;
-    }
-
-    // --- Check if freeze was requested (from GUI button) ---
-    if (freezeRequested.exchange (false))
-    {
-        if (!busy.load())
+        for (int s = 0; s < numSamples && pos < recTargetLength; ++s)
         {
-            busy.store (true);
-            // Launch freeze on a background thread
-            if (freezeThread) freezeThread->stopThread (2000);
-            freezeThread = std::make_unique<FreezeThread> (*this);
-            freezeThread->startThread();
+            float mono = 0.0f;
+            for (int ch = 0; ch < numChannels; ++ch)
+                mono += buffer.getSample (ch, s);
+            recBuffer[pos] = mono * scale;
+            ++pos;
         }
+        recWritePos.store (pos);
+
+        // Done recording? Launch freeze on a detached thread
+        if (pos >= recTargetLength)
+        {
+            state.store (Freezing);
+            std::thread ([this]() {
+                performFreeze();
+                freezeDone.store (true);
+            }).detach();
+        }
+    }
+
+    // --- Check if freeze just finished (lock-free swap) ---
+    if (freezeDone.exchange (false))
+    {
+        loopPlayhead = 0;
+        state.store (Playing);
     }
 
     // --- Play frozen loop ---
     int len = loopLength.load();
-    if (len > 0 && frozen.load())
+    auto* loop = activeLoop.load();
+    if (len > 0 && loop != nullptr && (state.load() == Playing))
     {
         float mix = mixParam->get();
         float dry = 1.0f - mix;
 
-        const juce::ScopedLock sl (freezeLock);
         for (int s = 0; s < numSamples; ++s)
         {
-            float frozenSample = loopBuffer[loopPlayhead];
+            float frozenSample = (*loop)[loopPlayhead];
             loopPlayhead = (loopPlayhead + 1) % len;
 
             for (int ch = 0; ch < numChannels; ++ch)
@@ -128,43 +101,61 @@ void FFTFreezerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 }
 
 //==============================================================================
-void FFTFreezerProcessor::triggerFreeze()
+void FFTFreezerProcessor::startRecording()
 {
-    performFreeze();
-    busy.store (false);
+    auto curState = state.load();
+    if (curState == Recording || curState == Freezing)
+        return; // already busy
+
+    recTargetLength = (int)(recLenParam->get() * currentSampleRate);
+    if (recTargetLength < 2048) recTargetLength = 2048;
+    if (recTargetLength > (int)recBuffer.size())
+        recTargetLength = (int)recBuffer.size();
+
+    recWritePos.store (0);
+    state.store (Recording);
 }
 
+float FFTFreezerProcessor::getRecordProgress() const
+{
+    if (state.load() != Recording) return 0.0f;
+    if (recTargetLength <= 0) return 0.0f;
+    return (float)recWritePos.load() / (float)recTargetLength;
+}
+
+//==============================================================================
 void FFTFreezerProcessor::performFreeze()
 {
-    // Determine FFT size = next power of 2 >= ringSize
-    int n = ringSize;
-    fftOrder = 1;
+    int n = recTargetLength;
+
+    // Find next power of 2
+    int fftOrder = 1;
     while ((1 << fftOrder) < n) ++fftOrder;
     if (fftOrder > maxOrder) fftOrder = maxOrder;
     n = 1 << fftOrder;
     int n2 = n / 2;
 
-    // Copy ring buffer content (unwrap from ringIndex) and apply window
+    // Apply fade window to recorded audio
+    int actualLen = recTargetLength;
     std::vector<float> input (n, 0.0f);
-    int actualLen = std::min (ringSize, n);
-    int idx = ringIndex;
+    int fade = std::min (1000, actualLen / 2);
     for (int i = 0; i < actualLen; ++i)
     {
-        int ri = (idx + i) % ringSize;
-        float w = (i < (int)window.size()) ? window[i] : 1.0f;
-        input[i] = ringBuffer[ri] * w;
+        float w = 1.0f;
+        if (i < fade)          w = (float)i / (float)fade;
+        else if (i >= actualLen - fade) w = (float)(actualLen - 1 - i) / (float)fade;
+        input[i] = recBuffer[i] * w;
     }
 
-    // Forward FFT (JUCE FFT is in-place, interleaved complex)
+    // Forward FFT
     juce::dsp::FFT fft (fftOrder);
-    // JUCE FFT expects 2*n floats (n complex pairs) for real FFT
     std::vector<float> fftData (n * 2, 0.0f);
     for (int i = 0; i < n; ++i)
         fftData[i] = input[i];
 
     fft.performRealOnlyForwardTransform (fftData.data(), true);
 
-    // Extract magnitudes (interleaved: [re0, im0, re1, im1, ...])
+    // Extract magnitudes with threshold
     std::vector<float> magnitudes (n2 + 1, 0.0f);
     float thresh = threshParam->get();
     for (int i = 1; i < n2; ++i)
@@ -174,11 +165,10 @@ void FFTFreezerProcessor::performFreeze()
         float mag = std::sqrt (re * re + im * im);
         magnitudes[i] = (mag >= thresh) ? mag : 0.0f;
     }
-    // Zero DC and Nyquist
     magnitudes[0] = 0.0f;
     magnitudes[n2] = 0.0f;
 
-    // Randomize phases and reconstruct spectrum
+    // Randomize phases
     std::uniform_real_distribution<float> dist (-juce::MathConstants<float>::pi,
                                                  juce::MathConstants<float>::pi);
     for (int i = 0; i < n2 + 1; ++i)
@@ -187,33 +177,34 @@ void FFTFreezerProcessor::performFreeze()
         fftData[i * 2]     = magnitudes[i] * std::cos (phase);
         fftData[i * 2 + 1] = magnitudes[i] * std::sin (phase);
     }
-    // DC and Nyquist must be real (zero imaginary)
     fftData[0] = 0.0f; fftData[1] = 0.0f;
     fftData[n2 * 2] = 0.0f; fftData[n2 * 2 + 1] = 0.0f;
 
     // Inverse FFT
     fft.performRealOnlyInverseTransform (fftData.data());
 
-    // Scale by 1/n (JUCE IFFT doesn't normalize)
+    // Write to the inactive loop buffer, then swap
     float invN = 1.0f / (float)n;
+    auto* current = activeLoop.load();
+    auto* target = (current == &loopA) ? &loopB : &loopA;
 
-    // Write to loop buffer
-    {
-        const juce::ScopedLock sl (freezeLock);
-        loopBuffer.resize (n);
-        for (int i = 0; i < n; ++i)
-            loopBuffer[i] = fftData[i] * invN;
-        loopPlayhead = 0;
-        loopLength.store (n);
-        frozen.store (true);
-    }
+    if ((int)target->size() < n)
+        target->resize (n);
+
+    for (int i = 0; i < n; ++i)
+        (*target)[i] = fftData[i] * invN;
+
+    // Atomic swap — audio thread picks this up next block
+    loopLength.store (n);
+    activeLoop.store (target);
 }
 
 //==============================================================================
 void FFTFreezerProcessor::writeToDisk()
 {
     int len = loopLength.load();
-    if (len <= 0 || !frozen.load()) return;
+    auto* loop = activeLoop.load();
+    if (len <= 0 || loop == nullptr || state.load() != Playing) return;
 
     fileChooser = std::make_shared<juce::FileChooser> (
         "Save Frozen Loop",
@@ -224,9 +215,12 @@ void FFTFreezerProcessor::writeToDisk()
     auto sr = currentSampleRate;
     auto chooserPtr = fileChooser;
 
+    // Copy loop data so we don't hold references during async callback
+    std::vector<float> loopCopy (loop->begin(), loop->begin() + len);
+
     fileChooser->launchAsync (
         juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
-        [this, len, sr, chooserPtr] (const juce::FileChooser& fc)
+        [len, sr, chooserPtr, loopData = std::move (loopCopy)] (const juce::FileChooser& fc)
         {
             auto file = fc.getResult();
             if (file == juce::File{}) return;
@@ -242,9 +236,8 @@ void FFTFreezerProcessor::writeToDisk()
             if (writer)
             {
                 fos.release();
-                const juce::ScopedLock sl (freezeLock);
                 juce::AudioBuffer<float> buf (1, len);
-                buf.copyFrom (0, 0, loopBuffer.data(), len);
+                buf.copyFrom (0, 0, loopData.data(), len);
                 writer->writeFromAudioSampleBuffer (buf, 0, len);
             }
         });

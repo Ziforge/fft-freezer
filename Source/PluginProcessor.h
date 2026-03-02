@@ -32,14 +32,15 @@ public:
     void getStateInformation (juce::MemoryBlock&) override {}
     void setStateInformation (const void*, int) override {}
 
-    // --- Freeze API ---
-    void triggerFreeze();
+    // --- Public API for editor ---
+    void startRecording();
     void writeToDisk();
 
-    // State queries for the editor
-    bool isFrozen() const { return frozen.load(); }
-    bool isBusy() const { return busy.load(); }
+    enum State { Idle, Recording, Freezing, Playing };
+    State getState() const { return state.load(); }
+    float getRecordProgress() const;
     int getLoopLength() const { return loopLength.load(); }
+    double getSampleRate() const { return currentSampleRate; }
 
     // Parameters
     juce::AudioParameterFloat* threshParam;
@@ -50,35 +51,25 @@ private:
     void performFreeze();
 
     // FFT
-    static constexpr int maxOrder = 16; // up to 65536 samples
-    int fftOrder = 14;                  // default 16384
+    static constexpr int maxOrder = 17; // up to 131072 samples
 
-    // Recording ring buffer
-    std::vector<float> ringBuffer;
-    int ringIndex = 0;
-    int ringSize = 0;
+    // Recording buffer (filled during Recording state)
+    std::vector<float> recBuffer;
+    std::atomic<int> recWritePos { 0 };
+    int recTargetLength = 0;
 
-    // Frozen loop
-    std::vector<float> loopBuffer;
+    // Frozen loop (double-buffered: audio reads A, freeze writes B, then swap)
+    std::vector<float> loopA, loopB;
+    std::atomic<std::vector<float>*> activeLoop { nullptr };
     std::atomic<int> loopLength { 0 };
     int loopPlayhead = 0;
 
-    // Fade window for recording
-    std::vector<float> window;
-
-public:
-    std::atomic<bool> freezeRequested { false };
-private:
-    std::atomic<bool> frozen { false };
-    std::atomic<bool> busy { false };
+    // State machine
+    std::atomic<State> state { Idle };
+    std::atomic<bool> freezeDone { false };
 
     double currentSampleRate = 44100.0;
     std::mt19937 rng;
-
-    // Thread for freeze computation
-    std::unique_ptr<juce::Thread> freezeThread;
-
-    juce::CriticalSection freezeLock;
 
     std::shared_ptr<juce::FileChooser> fileChooser;
 
